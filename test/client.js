@@ -2,11 +2,11 @@
 
 const timers = require('node:timers/promises');
 const { Blob } = require('node:buffer');
-const { randomUUID } = require('node:crypto');
 const { test } = require('node:test');
 const assert = require('node:assert');
 const { WebSocketServer } = require('ws');
 const metautil = require('metautil');
+const { randomUUID } = require('node:crypto');
 const { Metacom } = require('../lib/metacom.js');
 const { chunkEncode, chunkDecode } = require('../lib/chunks.js');
 
@@ -42,8 +42,10 @@ test('Client / calls', async (t) => {
     },
   };
 
+  let serverWs = null;
   const mockServer = new WebSocketServer({ port: 8000 });
   mockServer.on('connection', (ws) => {
+    serverWs = ws;
     ws.on('message', async (raw) => {
       const packet = metautil.jsonParse(raw) || {};
       const { type, id, method } = packet;
@@ -64,15 +66,12 @@ test('Client / calls', async (t) => {
   t.after(() => void mockServer.close());
 
   t.beforeEach(async () => {
-    client = Metacom.create('ws://localhost:8000/', {
-      callTimeout: 300,
-      generateId: randomUUID,
-    });
-    await client.opening;
+    const options = { callTimeout: 300 };
+    client = await Metacom.connect('ws://localhost:8000/', options);
     await client.load('test');
   });
 
-  t.afterEach(async () => void client.close());
+  t.afterEach(() => void client.close());
 
   await t.test('handles simple api calls', async () => {
     const result = await client.api.test.test();
@@ -97,24 +96,15 @@ test('Client / calls', async (t) => {
       (error) => error.message === 'Error message' && error.code === 400,
     );
   });
-});
 
-test('Client / handlePacket', async (t) => {
-  await t.test('throws on invalid JSON packet', async () => {
-    const client = Metacom.create('http://localhost:0/', {});
-    await client.opening;
-    await assert.rejects(
-      client.handlePacket('not json'),
-      /Invalid JSON packet/,
-    );
-    client.close();
-  });
-
-  await t.test('throws on non-string packet', async () => {
-    const client = Metacom.create('http://localhost:0/', {});
-    await client.opening;
-    await assert.rejects(client.handlePacket(null), /Invalid JSON packet/);
-    client.close();
+  await t.test('emits error when server sends invalid JSON', async () => {
+    const errorPromise = new Promise((resolve) => {
+      client.once('error', resolve);
+    });
+    assert.ok(serverWs, 'expected WebSocket connection from mock server');
+    serverWs.send('not json');
+    const error = await errorPromise;
+    assert.match(error.message, /Invalid JSON packet/);
   });
 });
 
@@ -165,17 +155,22 @@ test('Client / stale callback', async (t) => {
   t.after(() => void mockServer.close());
 
   await t.test('throws on stale callback for unknown id', async () => {
-    const client = Metacom.create('ws://localhost:8010/', {
-      generateId: randomUUID,
+    const client = await Metacom.connect('ws://localhost:8010/');
+    const promise1 = new Promise((resolve) => {
+      client.once('error', (error) => {
+        assert.match(error.message, /Callback stale-id-not-in-calls not found/);
+        resolve(error);
+      });
+      client.on('error', () => {});
     });
-    client.on('error', () => {});
-    const promise = new Promise((resolve) => client.once('error', resolve));
-    await client.opening;
+    const promise2 = new Promise((resolve) => client.once('error', resolve));
     await client.load('test');
     const result = await client.api.test.test();
     assert.deepStrictEqual(result, { success: true });
-    const error = await promise;
+    const error = await promise1;
     assert.match(error.message, /Callback stale-id-not-in-calls not found/);
+    const error2 = await promise2;
+    assert.match(error2.message, /Callback stale-id-not-in-calls not found/);
     client.close();
   });
 });
@@ -222,12 +217,11 @@ test('Client / events', async (t) => {
   t.after(() => void mockServer.close());
 
   t.beforeEach(async () => {
-    client = Metacom.create('ws://localhost:8001/', { generateId: randomUUID });
-    await client.opening;
+    client = await Metacom.connect('ws://localhost:8001/');
     await client.load('test');
   });
 
-  t.afterEach(async () => void client.close());
+  t.afterEach(() => void client.close());
 
   await t.test('handles events from server', async () => {
     const ping = await new Promise((resolve) =>
@@ -325,14 +319,13 @@ test('Client / stream', async (t) => {
   t.after(() => void mockServer.close());
 
   t.beforeEach(async () => {
-    client = Metacom.create('ws://localhost:8002/', { generateId: randomUUID });
-    await client.opening;
+    client = await Metacom.connect('ws://localhost:8002/');
     await client.load('test');
   });
 
-  t.afterEach(async () => void client.close());
+  t.afterEach(() => void client.close());
 
-  await t.test('handles file uploades', async () => {
+  await t.test('handles file uploads', async () => {
     const data = 'Some random data for upload to the server';
     const name = 'upload-stream';
     const blob = new Blob([data]);
@@ -371,7 +364,7 @@ test('Client / different ID generation strategies', async (t) => {
     },
   };
 
-  const mockServer = new WebSocketServer({ port: 8003 });
+  const mockServer = new WebSocketServer({ port: 8004 });
   mockServer.on('connection', (ws) => {
     ws.on('message', async (raw) => {
       const packet = metautil.jsonParse(raw) || {};
@@ -391,45 +384,7 @@ test('Client / different ID generation strategies', async (t) => {
   t.after(() => void mockServer.close());
 
   await t.test('works with UUID generation', async () => {
-    const client = Metacom.create('ws://localhost:8003/', {
-      generateId: randomUUID,
-    });
-    await client.opening;
-    await client.load('test');
-    const result = await client.api.test.test();
-    assert.deepStrictEqual(result, { success: true });
-    client.close();
-  });
-
-  await t.test('works with incremental IDs', async () => {
-    let counter = 1;
-    const client = Metacom.create('ws://localhost:8003/', {
-      generateId: () => String(counter++),
-    });
-    await client.opening;
-    await client.load('test');
-    const result = await client.api.test.test();
-    assert.deepStrictEqual(result, { success: true });
-    client.close();
-  });
-
-  await t.test('works with timestamp-based IDs', async () => {
-    const client = Metacom.create('ws://localhost:8003/', {
-      generateId: () =>
-        `ts_${Date.now()}_${Math.random().toString(36).substring(2)}`,
-    });
-    await client.opening;
-    await client.load('test');
-    const result = await client.api.test.test();
-    assert.deepStrictEqual(result, { success: true });
-    client.close();
-  });
-
-  await t.test('works with short random IDs', async () => {
-    const client = Metacom.create('ws://localhost:8003/', {
-      generateId: () => Math.random().toString(36).substring(2, 8),
-    });
-    await client.opening;
+    const client = await Metacom.connect('ws://localhost:8004/');
     await client.load('test');
     const result = await client.api.test.test();
     assert.deepStrictEqual(result, { success: true });

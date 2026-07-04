@@ -9,16 +9,18 @@
 Metacom protocol specification:
 https://github.com/metarhia/Contracts/blob/master/doc/Metacom.md
 
-```js
-import { Metacom } from 'metacom';
-// const { Metacom } = require('metacom'); // for backend
+## Client usage
 
-const metacom = Metacom.create('ws://domainname.com:8000');
+```js
+const { Metacom } = require('metacom'); // for Node.js
+import { Metacom } from 'metacom'; // for browser
+// const { Metacom } = require('metacom'); // for backend
+const metacom = await Metacom.connect('ws://domainname.com:8000');
 const { api } = metacom;
 try {
   await metacom.load('auth'); // Load `auth` interface
   await api.auth.status(); // Check session status
-} catch (err) {
+} catch (error) {
   await api.auth.signIn({ login: 'marcus', password: 'marcus' });
 }
 await metacom.load('example'); // Load `example` interface
@@ -32,7 +34,7 @@ const result = api.example.methodName({ arg1, arg2 });
 Create `uploadFile` function on the client:
 
 ```js
-const metacom = Metacom.create('ws://example.com/api');
+const metacom = await Metacom.connect('ws://example.com/api');
 
 const uploadFile = async (file) => {
   // createBlobUploader creates streamId and inits file reader for convenience
@@ -69,13 +71,13 @@ async ({ streamId, name }) => {
 Create `downloadFile` function on the client:
 
 ```js
-const metacom = Metacom.create('ws://example.com/api');
+const metacom = await Metacom.connect('ws://example.com/api');
 
 const downloadFile = async (name) => {
   // Init backend file producer to get streamId
   const { streamId } = await metacom.api.files.download({ name });
   // Get metacom readable stream
-  const readable = await metacom.getStream(streamId);
+  const readable = metacom.getStream(streamId);
   // Convert stream to blob to make a file on the client
   const blob = await readable.toBlob();
   return new File([blob], name);

@@ -1,37 +1,58 @@
-import { EventEmitter } from 'node:events';
-import { ClientRequest, ServerResponse } from 'node:http';
-import { Writable } from 'node:stream';
-import WebSocket from 'ws';
-import { Semaphore } from 'metautil';
+import {
+  IncomingMessage,
+  Server as HttpServer,
+  ServerResponse,
+} from 'node:http';
+import { Readable, Writable } from 'node:stream';
+import { Emitter } from 'metautil';
+import WebSocket, { WebSocketServer } from 'ws';
 
-export interface MetacomError extends Error {
-  code: string;
+export class MetacomError extends Error {
+  code: number;
+  constructor(options: { message: string; code: number });
 }
 
-export class MetaReadable extends EventEmitter {
+export interface ReadableOptions {
+  highWaterMark?: number;
+}
+
+export class MetaReadable extends Emitter {
   id: string;
   name: string;
   size: number;
+  queue: Array<ArrayBufferView>;
+  streaming: boolean;
+  status: string;
+  bytesRead: number;
+  highWaterMark: number;
   constructor(
     id: string,
     name: string,
     size: number,
-    options?: {
-      highWaterMark?: number;
-    },
+    options?: ReadableOptions,
   );
   push(data: ArrayBufferView): Promise<ArrayBufferView>;
   finalize(writable: Writable): Promise<void>;
   pipe(writable: Writable): Writable;
   toBlob(type?: string): Promise<Blob>;
+  close(): Promise<void>;
+  terminate(): Promise<void>;
+  read(): Promise<ArrayBufferView | null>;
+  [Symbol.asyncIterator](): AsyncIterableIterator<ArrayBufferView>;
 }
 
-export class MetaWritable extends EventEmitter {
+export interface Transport {
+  send(obj: object): void;
+  write(data: string | ArrayBufferView): void;
+}
+
+export class MetaWritable extends Emitter {
   id: string;
   name: string;
   size: number;
+  transport: Transport;
   constructor(id: string, name: string, size: number, transport: Transport);
-  write(data: ArrayBufferView): void;
+  write(data: ArrayBufferView): boolean;
   end(): void;
   terminate(): void;
 }
@@ -41,43 +62,92 @@ export interface BlobUploader {
   upload(): Promise<void>;
 }
 
-export class Metacom extends EventEmitter {
+export class ClientTransport extends Emitter {
   url: string;
-  socket: WebSocket;
-  api: object;
-  callId: number;
-  calls: Map<string, [Function, Function]>;
+  active: boolean;
   constructor(url: string);
-  static create(url: string, options?: unknown): Metacom;
-  ready(): Promise<void>;
-  load(...interfaces: Array<string>): Promise<void>;
-  httpCall(
-    unit: string,
-    ver: string,
-  ): (methodName: string) => (args: object) => Promise<void>;
-  socketCall(
-    unit: string,
-    ver: string,
-  ): (methodName: string) => (args: object) => Promise<void>;
-  getStream(id: string): MetaReadable;
+  open(options?: MetacomOptions): Promise<void>;
+  close(): void;
+  send(obj: object): void;
+  write(data: string | ArrayBufferView): void;
+  online(): void;
+  offline(): void;
+}
+
+export class Metacom extends Emitter {
+  static connections: Set<Metacom>;
+  static isOnline: boolean;
+  static online(): void;
+  static offline(): void;
+  static initialize(): void;
+  static connect(url: string, options?: MetacomOptions): Promise<Metacom>;
+  static transport: {
+    ws: new (url: string) => Transport;
+    http: new (url: string) => Transport;
+    event: {
+      getInstance(url: string): Transport;
+    };
+  };
+
+  url: string;
+  api: Record<string, Emitter>;
+  readonly active: boolean;
+
+  constructor(url: string, transport: Transport, options?: MetacomOptions);
+  open(): Promise<void>;
+  close(): void;
+  load(...units: Array<string>): Promise<void>;
+  getStream(id: string): MetaReadable | MetaWritable;
   createStream(name: string, size: number): MetaWritable;
   createBlobUploader(blob: Blob): BlobUploader;
+  send(obj: object): void;
+  write(data: string | ArrayBufferView): void;
+}
+
+export interface MetacomOptions {
+  callTimeout?: number;
+  reconnectTimeout?: number;
+  worker?: ServiceWorker;
+  packetHandler?: (data: string) => void | Promise<void>;
+  binaryHandler?: (
+    input: ArrayBuffer | ArrayBufferView | Blob,
+  ) => void | Promise<void>;
+}
+
+export class MetacomProxy extends Emitter {
+  constructor(options?: MetacomOptions);
+  open(): Promise<void>;
+  close(): void;
+}
+
+export interface ApplicationContext {
+  console: Console;
+  auth: Auth;
+  static: {
+    constructor: { name: string };
+    serve(path: string, transport: Transport): void;
+  };
+  getMethod(unit: string, version: string, methodName: string): object | null;
 }
 
 export interface Options {
-  concurrency: number;
   host: string;
   port: number;
-  kind: 'server' | 'balancer';
-  protocol: string;
-  ports: Array<number>;
-  queue: object;
+  kind?: 'server' | 'balancer';
+  protocol?: string;
+  ports?: Array<number>;
+  cors?: { origin: string };
+  nagle?: boolean;
+  key?: string;
+  cert?: string;
+  SNICallback?: Function;
+  timeouts?: { bind: number };
+  retry?: number;
 }
 
 export interface ErrorOptions {
   id?: string;
   error?: Error;
-  pass?: boolean;
 }
 
 export interface Auth {
@@ -90,31 +160,69 @@ export interface Auth {
   getUser(login: string): Promise<object>;
 }
 
-export class Client extends EventEmitter {
-  ip: string | undefined;
-  session: Session;
+export type EventName = PropertyKey;
+
+export class Client extends Emitter {
+  source: string;
+  session: Session | null;
+  streams: Map<string, MetaReadable | MetaWritable>;
+  error(code: number, options?: ErrorOptions): void;
+  send(obj: object, options?: { code?: number; method?: string }): void;
+  createContext(): Context;
+  emit(name: EventName, data: unknown): Promise<void>;
+  sendEvent(name: string, data?: unknown): void;
+  getStream(id: string): MetaReadable | MetaWritable;
+  createStream(name: string, size: number): MetaWritable;
+  initializeSession(token: string, data?: object): boolean;
+  finalizeSession(): boolean;
+  startSession(token: string, data?: object): boolean;
+  restoreSession(token: string): boolean;
+  close(): void;
+  destroy(): void;
 }
 
-export class Transport {
-  console: Console;
-  req: ClientRequest;
-  res?: ServerResponse;
-  connection?: WebSocket;
-  ip: string;
+export interface TransportOptions {
+  headers?: Record<string, string>;
+}
+
+export class ServerTransport extends Emitter {
+  static transport: {
+    http: typeof ServerHttpTransport;
+    ws: typeof ServerWsTransport;
+    event: typeof ServerEventTransport;
+  };
+  source: string;
+  constructor(source: string);
+  error(code?: number, options?: ErrorOptions): void;
+  send(obj: object, code?: number): void;
+}
+
+export class ServerHttpTransport extends ServerTransport {
+  req: IncomingMessage;
+  res: ServerResponse;
+  headers: Record<string, string>;
   constructor(
-    console: Console,
-    req: ClientRequest,
-    target: ServerResponse | WebSocket,
+    req: IncomingMessage,
+    res: ServerResponse,
+    options?: TransportOptions,
   );
-  error(code: number, errorOptions?: ErrorOptions): void;
-  write(data: string | Buffer, httpCode?: number, ext?: string): void;
-  send(obj: object, httpCode?: number): void;
-  redirect?(location: string): void;
-  options?(): void;
-  getCookies?(): object;
+  write(data: string | Buffer, httpCode?: number): void;
+  options(): void;
+  getCookies(): Record<string, string>;
   sendSessionCookie(token: string): void;
   removeSessionCookie(): void;
-  close(): void;
+}
+
+export class ServerWsTransport extends ServerTransport {
+  connection: WebSocket;
+  constructor(req: IncomingMessage, connection: WebSocket);
+  write(data: string | Buffer): void;
+}
+
+export class ServerEventTransport extends ServerTransport {
+  port: MessagePort;
+  constructor(port: MessagePort);
+  write(data: string | Buffer): void;
 }
 
 export interface CallPacket {
@@ -122,53 +230,26 @@ export interface CallPacket {
   id: string;
   method: string;
   args: object;
-  meta: object;
 }
 
 export interface StreamPacket {
   type: 'stream';
   id: string;
-  name: string;
-  size: number;
+  name?: string;
+  size?: number;
+  status?: 'end' | 'terminate';
 }
 
 export class Server {
-  application: object;
-  options: Options;
-  balancer: boolean;
-  console: Console;
-  semaphore: Semaphore;
-  httpServer: any;
-  wsServer: any;
-  clients: Set<Client>;
-  constructor(options: Options, application: object);
-  init(): void;
-  listen(): Promise<void>;
-  message(client: Client, data: string): void;
-  rpc(client: Client, packet: CallPacket): Promise<void>;
-  binary(client: Client, data: Buffer): void;
-  handleRpcPacket(client: Client, packet: CallPacket): void;
-  handleStreamPacket(client: Client, packet: StreamPacket): Promise<void>;
-  handleRequest(
-    client: Client,
-    transport: Transport,
-    data: Buffer,
-    application: object,
-  ): void;
-  hook(
-    client: Client,
-    proc: object,
-    packet: CallPacket,
-    verb: string,
-    headers: object,
-  ): Promise<void>;
-  balancing(transport: Transport): void;
-  closeClients(): void;
+  httpServer: HttpServer;
+  wsServer: WebSocketServer | null;
+  constructor(context: ApplicationContext, options: Options);
+  listen(): Promise<Server>;
   close(): Promise<void>;
 }
 
 export interface State {
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 export interface Session {
@@ -179,6 +260,17 @@ export interface Session {
 export interface Context {
   client: Client;
   uuid: string;
-  state: State;
-  session: Session;
+  state: Record<string, unknown>;
+  session: Session | null;
 }
+
+export function createProxy<T extends object>(
+  data: T,
+  save?: (data: T) => void,
+): T;
+
+export function chunkEncode(id: string, payload: Uint8Array): Uint8Array;
+export function chunkDecode(chunk: Uint8Array): {
+  id: string;
+  payload: Uint8Array;
+};
